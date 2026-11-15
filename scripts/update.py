@@ -91,6 +91,24 @@ def idn_encode(url: str) -> str:
     )
 
 
+def absolutize_paths(obj, base_url: str):
+    """把配置里的相对路径（./xxx、../xxx）按原始配置地址补全为绝对 URL。
+    原配置挂在作者服务器上时相对路径能用，镜像到 GitHub 后会指向不存在的文件（404），
+    因此必须在落盘前转换。已是绝对地址的字符串原样保留，可重复调用。"""
+    if isinstance(obj, dict):
+        return {k: absolutize_paths(v, base_url) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [absolutize_paths(v, base_url) for v in obj]
+    if isinstance(obj, str) and obj.startswith(("./", "../")):
+        return urllib.parse.urljoin(base_url, obj)
+    return obj
+
+
+def is_multi_repo(data) -> bool:
+    """是否为多仓订阅（顶层 urls 数组，没有 sites）。"""
+    return isinstance(data, dict) and isinstance(data.get("urls"), list) and not data.get("sites")
+
+
 def is_valid_tvbox_config(data) -> bool:
     """粗略校验：返回内容是否像 TVBox/影视仓 配置（单仓或多仓订阅）。"""
     if not isinstance(data, dict):
@@ -139,7 +157,7 @@ def fetch_config(url: str) -> dict:
             data = parse_json_lenient(resp.text)
             if not is_valid_tvbox_config(data):
                 raise ValueError("返回内容不是 TVBox 配置（缺少 sites/spiders/lives 或 urls 字段）")
-            return data
+            return absolutize_paths(data, target)
         except Exception as e:  # noqa: BLE001
             last_err = e
             text_len = len(getattr(resp, "text", "") or "") if "resp" in locals() else -1
@@ -175,12 +193,17 @@ def merge_configs(fetched):
     """把多个单仓配置合并成一个聚合单仓：
     - 以第一个成功源为基底（保留 spider/logo/wallpaper 等）
     - sites 按 key 去重，重复 key 加源 id 前缀
+    - 非基底源的 csp_ 爬虫站点若没有自带 jar，补上它所属源的 spider，
+      否则会去基底源的 jar 里找不存在的爬虫类而报错
     - lives/parses/doh/rules/flags/exts 等列表合并去重
+    - 多仓订阅类型的源没有 sites，不参与合并
     fetched: [(sid, name, data_dict), ...]
     """
+    fetched = [f for f in fetched if not is_multi_repo(f[2])]
     if not fetched:
         return None
     _base_sid, base_name, base = fetched[0]
+    base_spider = base.get("spider")
     merged = {}
     skip = {"sites", "lives", "parses", "doh", "rules", "flags", "exts", "ads"}
     for k, v in base.items():
@@ -193,9 +216,19 @@ def merge_configs(fetched):
     seen_keys = set()
     sites = []
     for sid, _name, data in fetched:
+        src_spider = data.get("spider")
         for s in data.get("sites", []) or []:
             if not isinstance(s, dict):
                 continue
+            if (
+                src_spider
+                and src_spider != base_spider
+                and s.get("type") == 3
+                and not s.get("jar")
+                and str(s.get("api", "")).startswith("csp_")
+            ):
+                s = dict(s)
+                s["jar"] = src_spider
             key = s.get("key")
             if key is None:
                 key = json.dumps(s, ensure_ascii=False, sort_keys=True)
@@ -295,6 +328,24 @@ def main() -> int:
     subscriptions = []
     fetched = []  # [(sid, name, data_dict), ...] 用于聚合单仓
 
+    seen_sub_urls = set()
+
+    def add_subscription(name, sid, data):
+        """单仓源指向本仓库镜像文件；多仓源展开成子仓逐条加入，
+        避免"多仓里套多仓"（大多数 App 不支持嵌套，选中会打不开）。"""
+        if is_multi_repo(data):
+            for child in data.get("urls", []):
+                if not isinstance(child, dict) or not child.get("url"):
+                    continue
+                if child["url"] in seen_sub_urls:
+                    continue
+                seen_sub_urls.add(child["url"])
+                subscriptions.append(
+                    {"name": f"{name}·{child.get('name', '未命名')}", "url": child["url"]}
+                )
+        else:
+            subscriptions.append({"name": name, "url": f"{raw_base}/{sid}.json"})
+
     ok_count = 0
     for src in cfg.get("sources", []):
         name = src.get("name", "未知")
@@ -313,9 +364,7 @@ def main() -> int:
                 entry["ok"] = True
                 entry["used_url"] = url
                 entry["error"] = None
-                subscriptions.append(
-                    {"name": name, "url": f"{raw_base}/{sid}.json"}
-                )
+                add_subscription(name, sid, data)
                 fetched.append((sid, name, data))
                 ok_count += 1
                 saved = True
@@ -335,10 +384,12 @@ def main() -> int:
                 try:
                     with open(cache_path, "r", encoding="utf-8") as f:
                         cached = json.load(f)
-                    if is_valid_tvbox_config(cached):
-                        subscriptions.append(
-                            {"name": name, "url": f"{raw_base}/{sid}.json"}
-                        )
+                    if is_valid_tvbox_config(cached) and urls:
+                        # 旧版脚本落盘的缓存可能仍含相对路径，按该源首个地址补全后回写
+                        cached = absolutize_paths(cached, idn_encode(urls[0]))
+                        with open(cache_path, "w", encoding="utf-8") as f:
+                            json.dump(cached, f, ensure_ascii=False, indent=2)
+                        add_subscription(name, sid, cached)
                         fetched.append((sid, name, cached))
                         entry["ok"] = True
                         entry["cached"] = True
